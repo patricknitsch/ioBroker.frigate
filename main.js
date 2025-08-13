@@ -61,7 +61,31 @@ class Frigate extends utils.Adapter {
       this.log.warn('No Frigate url set');
     }
     if (this.config.friurl.includes(':8971')) {
-      this.log.warn('You are using the UI port 8971. Please use the API port 5000');
+      this.log.warn('You are using the UI port 8971. Try to login');
+
+      const myHeaders = new Headers();
+      myHeaders.append("Content-Type", "application/json");
+      myHeaders.append("Accept", "application/json");
+
+      const raw = JSON.stringify({
+        "user": "test",
+        "password": "test1234"
+      });
+
+      const requestOptions = {
+        method: "POST",
+        headers: myHeaders,
+        body: raw,
+        redirect: "follow"
+      };
+      try {
+        fetch("https://${this.config.friurl}/api/login", requestOptions)
+        this.log.info(response.text());
+        this.log.info(result);
+      } catch (error) {
+        this.log.error(error);
+      }
+      
     }
     try {
       if (this.config.notificationMinScore) {
