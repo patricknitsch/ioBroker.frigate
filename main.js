@@ -81,8 +81,8 @@ class Frigate extends utils.Adapter {
     
       fetch("https://${this.config.friurl}/api/login", requestOptions)
       .then((response) => response.text())
-      .then((result) => console.log(result))
-      .catch((error) => console.error(error));
+      .then((result) => this.log.warn(result))
+      .catch((error) => this.log.error(error));
       
     }
     try {
