@@ -79,7 +79,7 @@ class Frigate extends utils.Adapter {
         redirect: "follow"
       };
     
-      fetch("https://${this.config.friurl}/api/login", requestOptions)
+      fetch('https://' + this.config.friurl + '/api/login', requestOptions)
       .then((response) => response.text())
       .then((result) => this.log.warn(result))
       .catch((error) => this.log.error(error));
