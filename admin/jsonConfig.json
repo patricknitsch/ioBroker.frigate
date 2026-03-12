@@ -85,18 +85,6 @@
                     "xl": 4,
                     "newLine": false
                 },
-                "frigateJwtToken": {
-                    "type": "password",
-                    "label": "Frigate API JWT Token",
-                    "help": "JWT token for Frigate API authentication (takes priority over username/password)",
-                    "hidden": "!!data.dockerFrigate?.enabled",
-                    "xs": 12,
-                    "sm": 12,
-                    "md": 6,
-                    "lg": 4,
-                    "xl": 4,
-                    "newLine": true
-                },
                 "_externalMqttHeader": {
                     "type": "header",
                     "text": "External MQTT Broker (optional)",

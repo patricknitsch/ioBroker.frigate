@@ -3,7 +3,6 @@ export interface FrigateAdapterConfigTyped {
     frigateUseTls: boolean;
     frigateUsername: string;
     frigatePassword: string;
-    frigateJwtToken: string;
     frigateRejectUnauthorized: boolean;
     mqttPort: number;
     externalMqttEnabled: boolean;
@@ -90,7 +89,6 @@ export interface FrigateAdapterConfig extends FrigateAdapterConfigTyped {
     frigateUseTls?: boolean;
     frigateUsername?: string;
     frigatePassword?: string;
-    frigateJwtToken?: string;
     frigateRejectUnauthorized?: boolean;
     mqttPort: number | string;
     externalMqttEnabled?: boolean;

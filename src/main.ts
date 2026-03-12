@@ -64,6 +64,7 @@ class FrigateAdapter extends Adapter {
     private server: Server;
     private requestClient: AxiosInstance;
     private frigateBaseUrl = '';
+    private frigateJwtToken = '';
     private json2iob: Json2iob;
     private tmpDir = tmpdir();
     private notificationMinScore: number | null = null;
@@ -149,22 +150,11 @@ class FrigateAdapter extends Adapter {
             'User-Agent': 'ioBroker.frigate',
             accept: '*/*',
         };
-        if (this.config.frigateJwtToken) {
-            axiosHeaders.Authorization = `Bearer ${this.config.frigateJwtToken}`;
-        } else if (this.config.frigateUsername) {
-            // Basic auth will be handled via axios auth option
-        }
         const axiosConfig: Parameters<typeof axios.create>[0] = {
             withCredentials: true,
             headers: axiosHeaders,
             timeout: 3 * 60 * 1000,
         };
-        if (this.config.frigateUsername && !this.config.frigateJwtToken) {
-            axiosConfig.auth = {
-                username: this.config.frigateUsername,
-                password: this.config.frigatePassword || '',
-            };
-        }
         if (this.config.frigateUseTls) {
             axiosConfig.httpsAgent = new https.Agent({
                 rejectUnauthorized: this.config.frigateRejectUnauthorized !== false,
@@ -253,6 +243,7 @@ class FrigateAdapter extends Adapter {
             }
         }
 
+        await this.initFrigateAuth();
         this.initMqtt();
     };
 
@@ -368,6 +359,75 @@ class FrigateAdapter extends Adapter {
     }
 
     /**
+     * Automatically fetch a JWT token from Frigate using username/password and apply it to the Axios instance.
+     * The token is read from the `frigate_token` cookie returned by the Frigate login endpoint.
+     * A response interceptor will re-authenticate and retry the original request on 401 errors.
+     */
+    async initFrigateAuth(): Promise<void> {
+        if (!this.config.frigateUsername) {
+            return;
+        }
+
+        const doLogin = async (): Promise<void> => {
+            try {
+                const response = await this.requestClient({
+                    url: `${this.frigateBaseUrl}/api/login`,
+                    method: 'post',
+                    data: {
+                        user: this.config.frigateUsername,
+                        password: this.config.frigatePassword || '',
+                    },
+                });
+                // Extract JWT from Set-Cookie header (frigate_token=<JWT>)
+                const rawCookies = response.headers['set-cookie'];
+                const cookies: string[] = Array.isArray(rawCookies) ? rawCookies : rawCookies ? [rawCookies] : [];
+                let token = '';
+                for (const cookie of cookies) {
+                    const match = /frigate_token=([^;]+)/.exec(cookie);
+                    if (match) {
+                        token = match[1];
+                        break;
+                    }
+                }
+                if (token) {
+                    this.frigateJwtToken = token;
+                    this.requestClient.defaults.headers.common.Authorization = `Bearer ${this.frigateJwtToken}`;
+                    this.log.info('Frigate: JWT token obtained automatically');
+                } else {
+                    this.log.warn('Frigate login succeeded but no frigate_token cookie was found in response');
+                }
+            } catch (error) {
+                this.log.error(
+                    `Frigate authentication failed: ${error instanceof Error ? error.message : String(error)}`,
+                );
+            }
+        };
+
+        await doLogin();
+
+        // Track request configs that have already been retried (avoids mutating the config object)
+        const retriedConfigs = new WeakSet<object>();
+
+        // Add interceptor to re-authenticate and retry on 401
+        this.requestClient.interceptors.response.use(undefined, async error => {
+            if (error.response?.status === 401 && error.config && !retriedConfigs.has(error.config)) {
+                retriedConfigs.add(error.config);
+                this.log.info('Frigate: 401 received, refreshing JWT token...');
+                await doLogin();
+                if (this.frigateJwtToken) {
+                    error.config.headers.Authorization = `Bearer ${this.frigateJwtToken}`;
+                }
+                return this.requestClient(error.config);
+            }
+            const reason =
+                error instanceof Error
+                    ? error
+                    : new Error(`${String(error?.response?.status ?? 'unknown')}: ${String(error)}`);
+            return Promise.reject(reason);
+        });
+    }
+
+    /**
      * Connect to an external MQTT broker and subscribe to Frigate topics
      */
     initExternalMqtt(): void {
@@ -379,7 +439,7 @@ class FrigateAdapter extends Adapter {
         this.log.info(`Connecting to external MQTT broker: ${brokerUrl}`);
 
         const connectOptions: mqtt.IClientOptions = {
-            clientId: `iobroker_frigate_${this.namespace.replace('.', '_')}`,
+            clientId: `iobroker_frigate_${UUID()}`,
             clean: true,
         };
         if (this.config.externalMqttUsername) {

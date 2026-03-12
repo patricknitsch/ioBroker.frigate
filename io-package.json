@@ -266,7 +266,6 @@
         "frigateRejectUnauthorized": true,
         "frigateUsername": "",
         "frigatePassword": "",
-        "frigateJwtToken": "",
         "externalMqttEnabled": false,
         "externalMqttHost": "",
         "externalMqttPort": 1883,
