@@ -115,6 +115,14 @@ as frigate uses disk to store the clips and snapshots.
     Placeholder for the next version (at the beginning of the line):
   ### **WORK IN PROGRESS**
 -->
+### **WORK IN PROGRESS**
+
+- (patricknitsch) **NEW**: Added TLS/HTTPS support for Frigate REST API (port 8971 now supported)
+- (patricknitsch) **NEW**: Added username/password and JWT token authentication for Frigate API
+- (patricknitsch) **NEW**: Added option to disable TLS certificate verification for self-signed certificates
+- (patricknitsch) **NEW**: Added external MQTT broker support with username/password and TLS options
+- (patricknitsch) **NEW**: Added camera classification notifications (send detected object counts via Telegram etc.)
+
 ### 2.1.1 (2026-03-08)
 - (@GermanBluefox) Added threshold for person detection in notifications
 
