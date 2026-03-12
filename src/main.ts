@@ -2,10 +2,12 @@ import fs, { existsSync } from 'node:fs';
 import { join, sep } from 'node:path';
 import { createServer, type Server } from 'node:net';
 import { tmpdir } from 'node:os';
+import https from 'node:https';
 
 import { v4 as UUID } from 'uuid';
 import axios, { type AxiosInstance } from 'axios';
 import Aedes, { type Client } from 'aedes';
+import mqtt, { type MqttClient } from 'mqtt';
 
 import { type AdapterOptions, Adapter, getAbsoluteDefaultDataDir } from '@iobroker/adapter-core';
 
@@ -60,7 +62,8 @@ type FrigateMessage = {
 class FrigateAdapter extends Adapter {
     declare config: FrigateAdapterConfig;
     private server: Server;
-    private readonly requestClient: AxiosInstance;
+    private requestClient: AxiosInstance;
+    private frigateBaseUrl = '';
     private json2iob: Json2iob;
     private tmpDir = tmpdir();
     private notificationMinScore: number | null = null;
@@ -70,6 +73,7 @@ class FrigateAdapter extends Adapter {
     private trackedObjectsHistory: FrigateMessage[] = [];
     private notificationExcludeArray: string[] = [];
     private readonly aedes: Aedes;
+    private mqttClient: MqttClient | null = null;
 
     constructor(options?: Partial<AdapterOptions>) {
         super({
@@ -84,12 +88,10 @@ class FrigateAdapter extends Adapter {
         this.on('message', this.onMessage);
         this.requestClient = axios.create({
             withCredentials: true,
-
             headers: {
                 'User-Agent': 'ioBroker.frigate',
                 accept: '*/*',
             },
-
             timeout: 3 * 60 * 1000, //3min client timeout
         });
         this.json2iob = new Json2iob(this);
@@ -132,14 +134,43 @@ class FrigateAdapter extends Adapter {
 
         if (!this.config.friurl) {
             this.log.warn('No Frigate url set');
-        } else if (this.config.friurl.includes(':8971')) {
-            this.log.warn('You are using the UI port 8971. Please use the API port 5000');
         }
         this.config.notificationMinScore = parseFloat(this.config.notificationMinScore as string) || 0;
         this.config.notificationEventClipWaitTime =
             parseFloat(this.config.notificationEventClipWaitTime as string) || 5;
         this.config.webnum = parseInt(this.config.webnum as string, 10) || 5;
         this.config.mqttPort = parseInt((this.config.mqttPort || '1883') as string, 10) || 1883;
+
+        // Build Axios instance with TLS and auth settings for Frigate REST API
+        const frigateScheme = this.config.frigateUseTls ? 'https' : 'http';
+        this.frigateBaseUrl = `${frigateScheme}://${this.config.friurl}`;
+
+        const axiosHeaders: Record<string, string> = {
+            'User-Agent': 'ioBroker.frigate',
+            accept: '*/*',
+        };
+        if (this.config.frigateJwtToken) {
+            axiosHeaders.Authorization = `Bearer ${this.config.frigateJwtToken}`;
+        } else if (this.config.frigateUsername) {
+            // Basic auth will be handled via axios auth option
+        }
+        const axiosConfig: Parameters<typeof axios.create>[0] = {
+            withCredentials: true,
+            headers: axiosHeaders,
+            timeout: 3 * 60 * 1000,
+        };
+        if (this.config.frigateUsername && !this.config.frigateJwtToken) {
+            axiosConfig.auth = {
+                username: this.config.frigateUsername,
+                password: this.config.frigatePassword || '',
+            };
+        }
+        if (this.config.frigateUseTls) {
+            axiosConfig.httpsAgent = new https.Agent({
+                rejectUnauthorized: this.config.frigateRejectUnauthorized !== false,
+            });
+        }
+        this.requestClient = axios.create(axiosConfig);
 
         try {
             if (this.config.notificationMinScore) {
@@ -329,6 +360,79 @@ class FrigateAdapter extends Adapter {
     }
 
     initMqtt(): void {
+        if (this.config.externalMqttEnabled) {
+            this.initExternalMqtt();
+        } else {
+            this.initInternalMqtt();
+        }
+    }
+
+    /**
+     * Connect to an external MQTT broker and subscribe to Frigate topics
+     */
+    initExternalMqtt(): void {
+        const host = this.config.externalMqttHost || 'localhost';
+        const port = parseInt((this.config.externalMqttPort || '1883') as string, 10) || 1883;
+        const protocol = this.config.externalMqttTls ? 'mqtts' : 'mqtt';
+        const brokerUrl = `${protocol}://${host}:${port}`;
+
+        this.log.info(`Connecting to external MQTT broker: ${brokerUrl}`);
+
+        const connectOptions: mqtt.IClientOptions = {
+            clientId: `iobroker_frigate_${this.namespace.replace('.', '_')}`,
+            clean: true,
+        };
+        if (this.config.externalMqttUsername) {
+            connectOptions.username = this.config.externalMqttUsername;
+            connectOptions.password = this.config.externalMqttPassword || '';
+        }
+        if (this.config.externalMqttTls) {
+            connectOptions.rejectUnauthorized = this.config.externalMqttRejectUnauthorized !== false;
+        }
+
+        this.mqttClient = mqtt.connect(brokerUrl, connectOptions);
+
+        this.mqttClient.on('connect', async () => {
+            this.log.info(`Connected to external MQTT broker: ${brokerUrl}`);
+            this.mqttClient!.subscribe('frigate/#', err => {
+                if (err) {
+                    this.log.error(`Failed to subscribe to frigate/#: ${err.message}`);
+                } else {
+                    this.log.info('Subscribed to frigate/# topics');
+                }
+            });
+            await this.setStateAsync('info.connection', true, true);
+            await this.fetchEventHistory();
+        });
+
+        this.mqttClient.on('reconnect', () => {
+            this.log.info('Reconnecting to external MQTT broker...');
+        });
+
+        this.mqttClient.on('close', async () => {
+            this.log.info('Disconnected from external MQTT broker');
+            await this.setStateAsync('info.connection', false, true);
+            await this.setStateAsync('available', 'offline', true);
+        });
+
+        this.mqttClient.on('error', err => {
+            this.log.error(`External MQTT broker error: ${err.message}`);
+        });
+
+        this.mqttClient.on('message', async (topic, payload) => {
+            if (topic === 'frigate/stats' || topic.endsWith('/snapshot')) {
+                this.log.silly(`mqtt message ${topic} ${payload.toString().substring(0, 100)}`);
+            } else {
+                this.log.debug(`mqtt message ${topic} ${payload.toString().substring(0, 200)}`);
+            }
+            await this.processMqttMessage(topic, payload);
+        });
+    }
+
+    /**
+     * Start the internal Aedes MQTT broker
+     */
+    initInternalMqtt(): void {
         this.server
             .listen(this.config.mqttPort, () => {
                 this.log.info(`MQTT server started and listening on port ${this.config.mqttPort}`);
@@ -370,134 +474,10 @@ class FrigateAdapter extends Adapter {
             }
 
             if (client) {
-                try {
-                    let pathArray = packet.topic.split('/');
-                    const dataStr = packet.payload.toString();
-                    let write = false;
-                    let data: FrigateMessage | string | undefined | number | boolean;
-                    if (pathArray[pathArray.length - 1] !== 'snapshot') {
-                        if (dataStr === 'ON') {
-                            data = true;
-                        } else if (dataStr === 'OFF') {
-                            data = false;
-                        } else if (
-                            !isNaN(Number(dataStr)) ||
-                            dataStr.includes('"') ||
-                            dataStr.includes('{') ||
-                            dataStr.includes('[')
-                        ) {
-                            try {
-                                data = JSON.parse(dataStr);
-                            } catch (error) {
-                                this.log.debug(`Cannot parse ${dataStr} ${error}`);
-                                // do nothing
-                            }
-                        } else {
-                            data = dataStr;
-                        }
-                    }
-
-                    if (pathArray[0] === 'frigate') {
-                        // remove first element "frigate" from path array
-                        pathArray.shift();
-                        const command: string = pathArray[0] as string;
-                        const event = pathArray[pathArray.length - 1];
-
-                        // Handle tracked_object_update events
-                        if (command === 'tracked_object_update' && typeof data === 'object') {
-                            await this.handleTrackedObjectUpdate(data);
-                            return;
-                        }
-
-                        // Ignore path data for states because they can be very large and are not needed in ioBroker. They are only used to create the snapshot and event history images.
-                        FrigateAdapter.removePathData(data);
-
-                        // convert snapshot jpg to base64 with data url
-                        if (event === 'snapshot') {
-                            data = `data:image/jpeg;base64,${packet.payload.toString('base64')}`;
-
-                            if (this.config.notificationCamera) {
-                                const uuid = UUID();
-                                const fileName = `${this.tmpDir}${sep}${uuid}.jpg`;
-                                this.log.debug(`Save ${event} image to ${fileName}`);
-                                fs.writeFileSync(fileName, packet.payload);
-                                await this.sendNotification({
-                                    source: command,
-                                    type: pathArray[1],
-                                    state: event,
-                                    image: fileName,
-                                });
-                                try {
-                                    if (fileName) {
-                                        this.log.debug(`Try to delete ${fileName}`);
-                                        fs.unlinkSync(fileName);
-                                        this.log.debug(`Deleted ${fileName}`);
-                                    }
-                                } catch (error) {
-                                    this.log.error(error);
-                                }
-                            }
-                        } else if (event === 'state') {
-                            // if last path state then make it writable
-                            write = true;
-                        } else if (event === 'events' && typeof data === 'object') {
-                            // events topic trigger history fetching
-                            await this.prepareEventNotification(data);
-                            await this.fetchEventHistory();
-                            // if (data.before?.start_time) {
-                            //   data.before.start_time = data.before.start_time.split('.')[0];
-                            //   data.before.end_time = data.before.end_time.split('.')[0];
-                            // }
-                            // if (data.after?.start_time) {
-                            //   data.after.start_time = data.after.start_time.split('.')[0];
-                            //   data.after.end_time = data.after.end_time.split('.')[0];
-                            // }
-                        } else if (command === 'reviews' && typeof data === 'object') {
-                            delete data.after.data.detections;
-                            delete data.before.data.detections;
-                        } else if (command === 'events' && typeof data === 'object') {
-                            delete data.after.path_data;
-                            delete data.before.path_data;
-                            if (data.after.snapshot && typeof data === 'object') {
-                                delete data.after.snapshot.path_data;
-                            }
-                            if (data.before.snapshot) {
-                                delete data.before.snapshot.path_data;
-                            }
-                            if (data.history) {
-                                for (const item of data.history) {
-                                    delete item.path_data;
-                                    if (item.snapshot) {
-                                        delete item.snapshot.path_data;
-                                    }
-                                }
-                            }
-                        } else if (command === 'stats' && typeof data === 'object') {
-                            // create devices state for cameras
-                            delete data.cpu_usages;
-
-                            await this.createCameraDevices();
-                        }
-
-                        if (
-                            command !== 'stats' &&
-                            command !== 'events' &&
-                            command !== 'available' &&
-                            command !== 'reviews' &&
-                            command !== 'camera_activity' &&
-                            pathArray.length > 1
-                        ) {
-                            // join every path item except the first one to create a flat hierarchy
-                            const cameraId = pathArray.shift() || '';
-                            pathArray = [cameraId, pathArray.join('_')];
-                        }
-                    }
-
-                    // parse json to iobroker states
-                    await this.json2iob.parse(pathArray.join('.'), data === undefined ? dataStr : data, { write });
-                } catch (error) {
-                    this.log.warn(error);
-                }
+                await this.processMqttMessage(
+                    packet.topic,
+                    Buffer.isBuffer(packet.payload) ? packet.payload : Buffer.from(packet.payload || ''),
+                );
             }
         });
         this.aedes.on('subscribe', (subscriptions, client) => {
@@ -518,6 +498,165 @@ class FrigateAdapter extends Adapter {
         this.aedes.on('connectionError', (client, err) =>
             this.log.warn(`client error: ${client.id} ${err.message} ${err.stack}`),
         );
+    }
+
+    /**
+     * Process an incoming MQTT message from either internal or external broker
+     */
+    async processMqttMessage(topic: string, payload: Buffer): Promise<void> {
+        try {
+            let pathArray = topic.split('/');
+            const dataStr = payload.toString();
+            let write = false;
+            let data: FrigateMessage | string | undefined | number | boolean;
+            if (pathArray[pathArray.length - 1] !== 'snapshot') {
+                if (dataStr === 'ON') {
+                    data = true;
+                } else if (dataStr === 'OFF') {
+                    data = false;
+                } else if (
+                    !isNaN(Number(dataStr)) ||
+                    dataStr.includes('"') ||
+                    dataStr.includes('{') ||
+                    dataStr.includes('[')
+                ) {
+                    try {
+                        data = JSON.parse(dataStr);
+                    } catch (error) {
+                        this.log.debug(`Cannot parse ${dataStr} ${error}`);
+                        // do nothing
+                    }
+                } else {
+                    data = dataStr;
+                }
+            }
+
+            if (pathArray[0] === 'frigate') {
+                // remove first element "frigate" from path array
+                pathArray.shift();
+                const command: string = pathArray[0] as string;
+                const event = pathArray[pathArray.length - 1];
+
+                // Handle tracked_object_update events
+                if (command === 'tracked_object_update' && typeof data === 'object') {
+                    await this.handleTrackedObjectUpdate(data);
+                    return;
+                }
+
+                // Ignore path data for states because they can be very large and are not needed in ioBroker. They are only used to create the snapshot and event history images.
+                FrigateAdapter.removePathData(data);
+
+                // convert snapshot jpg to base64 with data url
+                if (event === 'snapshot') {
+                    data = `data:image/jpeg;base64,${payload.toString('base64')}`;
+
+                    if (this.config.notificationCamera) {
+                        const uuid = UUID();
+                        const fileName = `${this.tmpDir}${sep}${uuid}.jpg`;
+                        this.log.debug(`Save ${event} image to ${fileName}`);
+                        fs.writeFileSync(fileName, payload);
+                        await this.sendNotification({
+                            source: command,
+                            type: pathArray[1],
+                            state: event,
+                            image: fileName,
+                        });
+                        try {
+                            if (fileName) {
+                                this.log.debug(`Try to delete ${fileName}`);
+                                fs.unlinkSync(fileName);
+                                this.log.debug(`Deleted ${fileName}`);
+                            }
+                        } catch (error) {
+                            this.log.error(error);
+                        }
+                    }
+                } else if (event === 'state') {
+                    // if last path state then make it writable
+                    write = true;
+                } else if (event === 'events' && typeof data === 'object') {
+                    // events topic trigger history fetching
+                    await this.prepareEventNotification(data);
+                    await this.fetchEventHistory();
+                } else if (command === 'reviews' && typeof data === 'object') {
+                    delete data.after.data.detections;
+                    delete data.before.data.detections;
+                } else if (command === 'events' && typeof data === 'object') {
+                    delete data.after.path_data;
+                    delete data.before.path_data;
+                    if (data.after.snapshot && typeof data === 'object') {
+                        delete data.after.snapshot.path_data;
+                    }
+                    if (data.before.snapshot) {
+                        delete data.before.snapshot.path_data;
+                    }
+                    if (data.history) {
+                        for (const item of data.history) {
+                            delete item.path_data;
+                            if (item.snapshot) {
+                                delete item.snapshot.path_data;
+                            }
+                        }
+                    }
+                } else if (command === 'stats' && typeof data === 'object') {
+                    // create devices state for cameras
+                    delete data.cpu_usages;
+
+                    await this.createCameraDevices();
+                }
+
+                if (
+                    command !== 'stats' &&
+                    command !== 'events' &&
+                    command !== 'available' &&
+                    command !== 'reviews' &&
+                    command !== 'camera_activity' &&
+                    pathArray.length > 1
+                ) {
+                    // join every path item except the first one to create a flat hierarchy
+                    const cameraId = pathArray.shift() || '';
+                    pathArray = [cameraId, pathArray.join('_')];
+                }
+            }
+
+            // parse json to iobroker states
+            await this.json2iob.parse(pathArray.join('.'), data === undefined ? dataStr : data, { write });
+        } catch (error) {
+            this.log.warn(error);
+        }
+    }
+
+    /**
+     * Publish a message to MQTT (either internal or external broker)
+     */
+    publishMqtt(topic: string, payload: string | Buffer): void {
+        if (this.config.externalMqttEnabled && this.mqttClient) {
+            this.mqttClient.publish(topic, payload, err => {
+                if (err) {
+                    this.log.error(`MQTT publish error for topic "${topic}": ${err.message}`);
+                } else {
+                    this.log.info(`published "${topic}" ${typeof payload === 'string' ? payload : '[binary]'}`);
+                }
+            });
+        } else {
+            this.aedes.publish(
+                {
+                    cmd: 'publish',
+                    qos: 0,
+                    topic,
+                    payload: typeof payload === 'string' ? Buffer.from(payload) : payload,
+                    retain: false,
+                    dup: false,
+                },
+                err => {
+                    if (err) {
+                        this.log.error(err.toString());
+                    } else {
+                        this.log.info(`published "${topic}" ${typeof payload === 'string' ? payload : '[binary]'}`);
+                    }
+                },
+            );
+        }
     }
 
     /**
@@ -563,7 +702,7 @@ class FrigateAdapter extends Adapter {
         if (this.firstStart) {
             this.log.info('Create Device information and fetch Event History');
             const data = await this.requestClient({
-                url: `http://${this.config.friurl}/api/config`,
+                url: `${this.frigateBaseUrl}/api/config`,
                 method: 'get',
             })
                 .then(response => {
@@ -571,7 +710,7 @@ class FrigateAdapter extends Adapter {
                     return response.data;
                 })
                 .catch(error => {
-                    this.log.warn(`createCameraDevices error from http://${this.config.friurl}/api/config`);
+                    this.log.warn(`createCameraDevices error from ${this.frigateBaseUrl}/api/config`);
                     this.log.error(error);
                     error.response && this.log.error(JSON.stringify(error.response.data));
                 });
@@ -696,6 +835,9 @@ class FrigateAdapter extends Adapter {
             }
             this.log.info(`Fetch event history for ${this.deviceArray.length - 1} cameras`);
             await this.fetchEventHistory();
+            if (this.config.notificationClassification) {
+                await this.fetchAndNotifyCameraClassifications();
+            }
             this.firstStart = false;
             this.log.info('Device information created');
         }
@@ -720,7 +862,7 @@ class FrigateAdapter extends Adapter {
             let imageUrl = '';
             let fileName = '';
             if (data.before.has_snapshot) {
-                imageUrl = `http://${this.config.friurl}/api/events/${data.before.id}/snapshot.jpg`;
+                imageUrl = `${this.frigateBaseUrl}/api/events/${data.before.id}/snapshot.jpg`;
             }
             if (data.after) {
                 // image = data.after.snapshot;
@@ -731,7 +873,7 @@ class FrigateAdapter extends Adapter {
                 zones = data.after.entered_zones;
 
                 if (data.after.has_snapshot) {
-                    imageUrl = `http://${this.config.friurl}/api/events/${data.after.id}/snapshot.jpg`;
+                    imageUrl = `${this.frigateBaseUrl}/api/events/${data.after.id}/snapshot.jpg`;
                 }
             }
             if (imageUrl) {
@@ -808,15 +950,15 @@ class FrigateAdapter extends Adapter {
                     let state = 'Event Before';
                     score = data.before.top_score;
                     zones = data.before.entered_zones;
-                    let clipUrl = `http://${this.config.friurl}/api/events/${data.before.id}/clip.mp4`;
-                    let clipm3u8 = `http://${this.config.friurl}/vod/event/${data.before.id}/master.m3u8`;
+                    let clipUrl = `${this.frigateBaseUrl}/api/events/${data.before.id}/clip.mp4`;
+                    let clipm3u8 = `${this.frigateBaseUrl}/vod/event/${data.before.id}/master.m3u8`;
 
                     if (data.after?.has_clip) {
                         state = 'Event After';
                         score = data.after.top_score;
                         zones = data.after.entered_zones;
-                        clipUrl = `http://${this.config.friurl}/api/events/${data.after.id}/clip.mp4`;
-                        clipm3u8 = `http://${this.config.friurl}/vod/event/${data.after.id}/master.m3u8`;
+                        clipUrl = `${this.frigateBaseUrl}/api/events/${data.after.id}/clip.mp4`;
+                        clipm3u8 = `${this.frigateBaseUrl}/vod/event/${data.after.id}/master.m3u8`;
                     }
                     if (this.config.notificationEventClipLink) {
                         await this.sendNotification({
@@ -919,7 +1061,7 @@ class FrigateAdapter extends Adapter {
             }
             try {
                 const response = await this.requestClient({
-                    url: `http://${this.config.friurl}/api/events`,
+                    url: `${this.frigateBaseUrl}/api/events`,
                     method: 'get',
                     params,
                 });
@@ -927,9 +1069,9 @@ class FrigateAdapter extends Adapter {
                     this.log.debug(`fetchEventHistory successful ${device}`);
 
                     for (const event of response.data) {
-                        event.websnap = `http://${this.config.friurl}/api/events/${event.id}/snapshot.jpg`;
-                        event.webclip = `http://${this.config.friurl}/api/events/${event.id}/clip.mp4`;
-                        event.webm3u8 = `http://${this.config.friurl}/vod/event/${event.id}/master.m3u8`;
+                        event.websnap = `${this.frigateBaseUrl}/api/events/${event.id}/snapshot.jpg`;
+                        event.webclip = `${this.frigateBaseUrl}/api/events/${event.id}/clip.mp4`;
+                        event.webm3u8 = `${this.frigateBaseUrl}/vod/event/${event.id}/master.m3u8`;
                         event.thumbnail = `data:image/jpeg;base64,${event.thumbnail}`;
                         delete event.path_data;
                     }
@@ -949,11 +1091,53 @@ class FrigateAdapter extends Adapter {
                     }
                 }
             } catch (error) {
-                this.log.warn(`fetchEventHistory error from http://${this.config.friurl}/api/events`);
+                this.log.warn(`fetchEventHistory error from ${this.frigateBaseUrl}/api/events`);
                 if (error.response && error.response.status >= 500) {
                     this.log.warn('Cannot reach server. You can ignore this after restarting the frigate server.');
                 }
                 this.log.warn(error);
+            }
+        }
+    }
+
+    /**
+     * Fetch object classifications for each camera and send Telegram notifications
+     */
+    async fetchAndNotifyCameraClassifications(): Promise<void> {
+        for (const camera of this.deviceArray) {
+            if (!camera) {
+                continue;
+            }
+            try {
+                const response = await this.requestClient({
+                    url: `${this.frigateBaseUrl}/api/${encodeURIComponent(camera)}/tracked_objects`,
+                    method: 'get',
+                });
+                if (response.data) {
+                    const classifications = response.data;
+                    this.log.debug(`Classifications for ${camera}: ${JSON.stringify(classifications)}`);
+                    await this.json2iob.parse(`${camera}.classifications`, classifications, {
+                        channelName: 'Camera Classifications',
+                    });
+                    if (this.config.notificationClassification && this.config.notificationActive) {
+                        for (const [label, count] of Object.entries(classifications)) {
+                            const countNum = typeof count === 'number' ? count : Number(count);
+                            if (countNum > 0) {
+                                await this.sendNotification({
+                                    source: camera,
+                                    type: label,
+                                    state: `${countNum} detected`,
+                                    status: 'classification',
+                                    score: 1,
+                                });
+                            }
+                        }
+                    }
+                }
+            } catch (error) {
+                this.log.debug(
+                    `fetchAndNotifyCameraClassifications: no classifications for ${camera} (${error instanceof Error ? error.message : String(error)})`,
+                );
             }
         }
     }
@@ -1205,7 +1389,11 @@ class FrigateAdapter extends Adapter {
      */
     onUnload = (callback: () => void): void => {
         try {
-            this.aedes.close(() => this.server.close(() => callback?.()));
+            if (this.mqttClient) {
+                this.mqttClient.end(true, undefined, () => callback?.());
+            } else {
+                this.aedes.close(() => this.server.close(() => callback?.()));
+            }
         } catch (e) {
             this.log.error(`Error onUnload: ${e}`);
             callback();
@@ -1229,23 +1417,7 @@ class FrigateAdapter extends Adapter {
 
                     const topic = pathArray.join('/');
                     this.log.debug(`publish sending to "${topic}" ${state.val}`);
-                    this.aedes.publish(
-                        {
-                            cmd: 'publish',
-                            qos: 0,
-                            topic,
-                            payload: Buffer.from(String(state.val ?? '')),
-                            retain: false,
-                            dup: false,
-                        },
-                        err => {
-                            if (err) {
-                                this.log.error(err.toString());
-                            } else {
-                                this.log.info(`published "${topic}" ${state.val}`);
-                            }
-                        },
-                    );
+                    this.publishMqtt(topic, String(state.val ?? ''));
                 } else if (id.endsWith('remote.createEvent')) {
                     //remove adapter name and instance from id
                     const cameraId = id.split('.')[2];
@@ -1265,7 +1437,7 @@ class FrigateAdapter extends Adapter {
                     const encodedCameraId = encodeURIComponent(cameraId);
                     const encodedLabel = encodeURIComponent(label != null ? label.toString() : '');
                     this.requestClient({
-                        url: `http://${this.config.friurl}/api/events/${encodedCameraId}/${encodedLabel}/create`,
+                        url: `${this.frigateBaseUrl}/api/events/${encodedCameraId}/${encodedLabel}/create`,
                         method: 'post',
                         data: body,
                     })
@@ -1274,49 +1446,17 @@ class FrigateAdapter extends Adapter {
                             this.log.info(JSON.stringify(response.data));
                         })
                         .catch(error => {
-                            this.log.warn(`createEvent error from http://${this.config.friurl}/api/events`);
+                            this.log.warn(`createEvent error from ${this.frigateBaseUrl}/api/events`);
                             this.log.error(error);
                         });
                 } else if (id.endsWith('remote.restart') && state.val) {
                     // remove adapter name and instance from id
-                    this.aedes.publish(
-                        {
-                            cmd: 'publish',
-                            qos: 0,
-                            topic: `frigate/restart`,
-                            retain: false,
-                            dup: false,
-                            payload: '',
-                        },
-                        err => {
-                            if (err) {
-                                this.log.error(err.toString());
-                            } else {
-                                this.log.info('published frigate/restart');
-                            }
-                        },
-                    );
+                    this.publishMqtt('frigate/restart', '');
                 } else if (id.endsWith('remote.ptz') && state.val !== null) {
                     //remove adapter name and instance from id
                     const cameraId = id.split('.')[2];
                     const command = state.val.toString();
-                    this.aedes.publish(
-                        {
-                            cmd: 'publish',
-                            qos: 0,
-                            topic: `frigate/${cameraId}/ptz`,
-                            payload: command,
-                            retain: false,
-                            dup: false,
-                        },
-                        err => {
-                            if (err) {
-                                this.log.error(err.toString());
-                            } else {
-                                this.log.info(`published frigate/${cameraId}/ptz ${command}`);
-                            }
-                        },
-                    );
+                    this.publishMqtt(`frigate/${cameraId}/ptz`, command);
                 } else if (id.endsWith('remote.pauseNotificationsForTime')) {
                     const pauseTime = parseInt(state.val as string, 10) || 10;
                     const pauseId = id

@@ -1,12 +1,25 @@
 export interface FrigateAdapterConfigTyped {
     friurl: string;
+    frigateUseTls: boolean;
+    frigateUsername: string;
+    frigatePassword: string;
+    frigateJwtToken: string;
+    frigateRejectUnauthorized: boolean;
     mqttPort: number;
+    externalMqttEnabled: boolean;
+    externalMqttHost: string;
+    externalMqttPort: number;
+    externalMqttUsername: string;
+    externalMqttPassword: string;
+    externalMqttTls: boolean;
+    externalMqttRejectUnauthorized: boolean;
     webnum: number;
     notificationMinScore: number;
     notificationActive: boolean;
     notificationInstances: string;
     notificationUsers: string;
     notificationCamera: boolean;
+    notificationClassification: boolean;
     notificationEventSnapshot: boolean;
     notificationEventSnapshotStart: boolean;
     notificationEventSnapshotUpdate: boolean;
@@ -74,13 +87,26 @@ export interface FrigateAdapterConfigTyped {
 
 export interface FrigateAdapterConfig extends FrigateAdapterConfigTyped {
     friurl: string;
+    frigateUseTls?: boolean;
+    frigateUsername?: string;
+    frigatePassword?: string;
+    frigateJwtToken?: string;
+    frigateRejectUnauthorized?: boolean;
     mqttPort: number | string;
+    externalMqttEnabled?: boolean;
+    externalMqttHost?: string;
+    externalMqttPort?: number | string;
+    externalMqttUsername?: string;
+    externalMqttPassword?: string;
+    externalMqttTls?: boolean;
+    externalMqttRejectUnauthorized?: boolean;
     webnum: number | string;
     notificationMinScore: number | string;
     notificationActive: boolean;
     notificationInstances: string;
     notificationUsers: string;
     notificationCamera: boolean;
+    notificationClassification?: boolean;
     notificationEventSnapshot: boolean;
     notificationEventSnapshotStart: boolean;
     notificationEventSnapshotUpdate: boolean;
