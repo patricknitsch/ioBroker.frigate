@@ -122,6 +122,8 @@ as frigate uses disk to store the clips and snapshots.
 - (patricknitsch) **NEW**: Added option to disable TLS certificate verification for self-signed certificates
 - (patricknitsch) **NEW**: Added external MQTT broker support with username/password and TLS options
 - (patricknitsch) **NEW**: Added camera classification notifications (send detected object counts via Telegram etc.)
+- (patricknitsch) **FIXED**: Prevent "DB closed" errors during adapter shutdown by adding isUnloading guard
+- (patricknitsch) **FIXED**: Prevent "thumbnail: data:image/jpeg;base64,null" when Frigate returns null thumbnail
 
 ### 2.1.3 (2026-03-19)
 - (@GermanBluefox) Remove wrong log message about missing docker

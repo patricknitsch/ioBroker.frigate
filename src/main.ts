@@ -89,6 +89,7 @@ class FrigateAdapter extends Adapter {
     private notificationsLog: { [id: string]: boolean } = {};
     private trackedObjectsHistory: FrigateMessage[] = [];
     private notificationExcludeArray: string[] = [];
+    private isUnloading = false;
     private readonly aedes: Aedes;
     private mqttClient: MqttClient | null = null;
 
@@ -598,6 +599,9 @@ class FrigateAdapter extends Adapter {
      * Process an incoming MQTT message from either internal or external broker
      */
     async processMqttMessage(topic: string, payload: Buffer): Promise<void> {
+        if (this.isUnloading) {
+            return;
+        }
         try {
             let pathArray = topic.split('/');
             const dataStr = payload.toString();
@@ -1152,6 +1156,9 @@ class FrigateAdapter extends Adapter {
     }
 
     async fetchEventHistory(): Promise<void> {
+        if (this.isUnloading) {
+            return;
+        }
         for (const device of this.deviceArray) {
             const params: {
                 limit: number;
@@ -1174,7 +1181,9 @@ class FrigateAdapter extends Adapter {
                         event.websnap = `${this.frigateBaseUrl}/api/events/${event.id}/snapshot.jpg`;
                         event.webclip = `${this.frigateBaseUrl}/api/events/${event.id}/clip.mp4`;
                         event.webm3u8 = `${this.frigateBaseUrl}/vod/event/${event.id}/master.m3u8`;
-                        event.thumbnail = `data:image/jpeg;base64,${event.thumbnail}`;
+                        if (event.thumbnail && event.thumbnail.trim()) {
+                            event.thumbnail = `data:image/jpeg;base64,${event.thumbnail}`;
+                        }
                         delete event.path_data;
                     }
                     let path = 'events.history';
@@ -1188,6 +1197,9 @@ class FrigateAdapter extends Adapter {
                         forceIndex: true,
                         channelName: 'Events history',
                     });
+                    if (this.isUnloading) {
+                        return;
+                    }
                     if (!device) {
                         await this.setStateAsync('events.history.json', JSON.stringify(response.data), true);
                     }
@@ -1206,6 +1218,9 @@ class FrigateAdapter extends Adapter {
      * Fetch object classifications for each camera and send Telegram notifications
      */
     async fetchAndNotifyCameraClassifications(): Promise<void> {
+        if (this.isUnloading) {
+            return;
+        }
         for (const camera of this.deviceArray) {
             if (!camera) {
                 continue;
@@ -1490,6 +1505,7 @@ class FrigateAdapter extends Adapter {
      * Is called when the adapter shuts down - callback has to be called under any circumstances!
      */
     onUnload = (callback: () => void): void => {
+        this.isUnloading = true;
         try {
             if (this.mqttClient) {
                 this.mqttClient.end(true, undefined, () => callback?.());
