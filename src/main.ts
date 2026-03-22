@@ -842,6 +842,13 @@ class FrigateAdapter extends Adapter {
                         },
                         native: {},
                     });
+                    await this.extendObjectAsync(`${key}.classifications`, {
+                        type: 'channel',
+                        common: {
+                            name: 'Classifications',
+                        },
+                        native: {},
+                    });
                     await this.extendObjectAsync(`${key}.remote`, {
                         type: 'channel',
                         common: {
@@ -941,6 +948,7 @@ class FrigateAdapter extends Adapter {
             }
             this.log.info(`Fetch event history for ${this.deviceArray.length - 1} cameras`);
             await this.fetchEventHistory();
+            await this.fetchCameraClassificationStates();
             if (this.config.notificationClassification) {
                 await this.fetchAndNotifyCameraClassifications();
             }
@@ -1210,6 +1218,38 @@ class FrigateAdapter extends Adapter {
                     this.log.warn('Cannot reach server. You can ignore this after restarting the frigate server.');
                 }
                 this.log.warn(error);
+            }
+        }
+    }
+
+    /**
+     * Fetch classification states for each camera (e.g., garage=open, door=closed)
+     * from the Frigate REST API and persist them as ioBroker states.
+     * Silently skips cameras for which the endpoint is not supported.
+     */
+    async fetchCameraClassificationStates(): Promise<void> {
+        if (this.isUnloading) {
+            return;
+        }
+        for (const camera of this.deviceArray) {
+            if (!camera) {
+                continue;
+            }
+            try {
+                const response = await this.requestClient({
+                    url: `${this.frigateBaseUrl}/api/${encodeURIComponent(camera)}/classifications`,
+                    method: 'get',
+                });
+                if (response.data && typeof response.data === 'object') {
+                    this.log.debug(`Classification states for ${camera}: ${JSON.stringify(response.data)}`);
+                    await this.json2iob.parse(`${camera}.classifications`, response.data, {
+                        channelName: 'Classifications',
+                    });
+                }
+            } catch (error) {
+                this.log.debug(
+                    `No classification states available for ${camera} (Frigate API may not support this endpoint): ${error instanceof Error ? error.message : String(error)}`,
+                );
             }
         }
     }

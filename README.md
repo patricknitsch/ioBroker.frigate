@@ -122,6 +122,7 @@ as frigate uses disk to store the clips and snapshots.
 - (patricknitsch) **NEW**: Added option to disable TLS certificate verification for self-signed certificates
 - (patricknitsch) **NEW**: Added external MQTT broker support with username/password and TLS options
 - (patricknitsch) **NEW**: Added camera classification notifications (send detected object counts via Telegram etc.)
+- (patricknitsch) **NEW**: Added classification states per camera (e.g., garage=open/closed) fetched from Frigate API under `{camera}.classifications`
 - (patricknitsch) **FIXED**: Prevent "DB closed" errors during adapter shutdown by adding isUnloading guard
 - (patricknitsch) **FIXED**: Prevent "thumbnail: data:image/jpeg;base64,null" when Frigate returns null thumbnail
 
