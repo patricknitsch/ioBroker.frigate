@@ -65,6 +65,7 @@
     "release-patch": "release-script patch --yes",
     "release-minor": "release-script minor --yes",
     "release-major": "release-script major --yes",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build",
     "build": "tsc -p tsconfig.build.json",
     "update-packages": "npx -y npm-check-updates"
